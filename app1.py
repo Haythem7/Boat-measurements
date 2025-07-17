@@ -1,7 +1,7 @@
 import streamlit as st
 import pandas as pd
 import plotly.express as px
-import random
+from datetime import datetime, timedelta
 
 # Title
 st.title("Boat Measures Visualization")
@@ -10,6 +10,7 @@ st.title("Boat Measures Visualization")
 df = pd.read_excel("dataset_janauaca_20210715_OneSpreadsheet.xlsx")
 df.columns = df.columns.str.strip()
 df["DATE"] = pd.to_datetime(df["DATE"])
+df["TIME_STR"] = df["TIME"].astype(str)  # Convert TIME to string
 
 # Grouped parameters
 parameter_groups = {
@@ -42,14 +43,14 @@ station_coords = df.groupby("NEW_ NAME")[["LATITUDE", "LONGITUDE"]].first().rese
 station_names = df["NEW_ NAME"].unique()
 selected_station = st.selectbox("Choose a station", station_names)
 
-# Parameter group selection
+# Parameter selection
 selected_group = st.selectbox("Choose parameter group", list(parameter_groups.keys()))
 selected_param = st.selectbox("Choose a parameter", parameter_groups[selected_group])
 
-# Get selected station coordinates
+# Coordinates for selected station
 selected_coords = station_coords[station_coords["NEW_ NAME"] == selected_station].iloc[0]
 
-# Map with selected station highlighted
+# Map
 fig_map = px.scatter_mapbox(
     station_coords,
     lat="LATITUDE",
@@ -78,43 +79,103 @@ fig_map.update_layout(
 
 st.plotly_chart(fig_map)
 
-# Filter data for selected station
+# Filter data
 station_df = df[df["NEW_ NAME"] == selected_station].copy()
-
-# Filter out rows where selected parameter is NaN
 valid_df = station_df[station_df[selected_param].notna()].copy()
 
-# Extract month-year for grouping
+# Group by month-year
 valid_df["MONTH_YEAR"] = valid_df["DATE"].dt.to_period("M")
-
-# Group by month-year and pick one random date from each (to ensure spacing)
 grouped = valid_df.groupby("MONTH_YEAR")
 one_date_per_month = grouped.apply(lambda g: g.sample(1)).reset_index(drop=True)
 
-# Select up to 6 of them, randomly
-selected_dates_df = one_date_per_month.sort_values("DATE")
-if len(selected_dates_df) > 6:
-    selected_dates_df = selected_dates_df.sample(6).sort_values("DATE")
+# Select up to 10 unique dates (or fewer if not enough)
+selected_dates = one_date_per_month["DATE"].sort_values().unique()
+if len(selected_dates) > 10:
+    selected_dates = pd.Series(selected_dates).sample(10).sort_values()
 
-# Plot the parameter
-fig_line = px.line(
-    selected_dates_df,
-    x="DATE",
-    y=selected_param,
-    markers=True,
-    title=f"{selected_param} over spaced dates for {selected_station}"
+# Store selected dates in session state
+state_key = f"{selected_station}_{selected_param}"
+if state_key not in st.session_state:
+    st.session_state[state_key] = selected_dates
+selected_dates = st.session_state[state_key]
+
+# Filter for selected dates
+selected_dates_df = valid_df[valid_df["DATE"].isin(selected_dates)].copy()
+selected_dates_df["DATE_STR"] = selected_dates_df["DATE"].dt.strftime("%Y-%m-%d")
+
+# Fix repeated times: for each date, adjust duplicates by adding 1 minute
+def adjust_duplicate_times(group):
+    seen = {}
+    new_times = []
+    for t in group["TIME_STR"]:
+        try:
+            parsed_time = datetime.strptime(t, "%H:%M:%S")
+        except:
+            try:
+                parsed_time = datetime.strptime(t, "%H:%M")
+            except:
+                parsed_time = datetime.strptime("00:00", "%H:%M")  # fallback if bad format
+
+        key = parsed_time.strftime("%H:%M")
+        count = seen.get(key, 0)
+        adjusted_time = parsed_time + timedelta(minutes=count)
+        seen[key] = count + 1
+        new_times.append(adjusted_time.strftime("%H:%M"))
+
+    return pd.Series(new_times, index=group.index)
+
+# Apply to each date group
+selected_dates_df["ADJUSTED_TIME"] = selected_dates_df.groupby("DATE_STR").apply(adjust_duplicate_times).reset_index(level=0, drop=True)
+
+# Build annotation text per date with HTML <br> for line breaks
+time_labels = selected_dates_df.groupby("DATE_STR")["ADJUSTED_TIME"].apply(
+    lambda times: "<br>".join(sorted(times.dropna()))
 )
 
-# Add TOTAL_DEPTH below each point
-for i, row in selected_dates_df.iterrows():
-    depth = row.get("TOTAL_DEPTH", "NA")
-    fig_line.add_annotation(
-        x=row["DATE"],
-        y=row[selected_param],
-        text=f"{depth} m",
-        showarrow=False,
-        yshift=-30,
-        font=dict(size=9, color="gray")
-    )
+# Plot scatter
+fig_scatter = px.scatter(
+    selected_dates_df,
+    x="DATE_STR",
+    y=selected_param,
+    color="DATE_STR",
+    labels={"DATE_STR": "Date"},
+    hover_data={
+        selected_param: True,
+        "SAMPLE_DEPTH": True
+    },
+    title=f"{selected_param} values on selected dates at {selected_station}"
+)
 
-st.plotly_chart(fig_line)
+# Update layout
+fig_scatter.update_layout(
+    xaxis_title="Date",
+    yaxis_title=selected_param,
+    xaxis=dict(
+        tickmode="array",
+        tickvals=sorted(selected_dates_df["DATE_STR"].unique()),
+        ticktext=sorted(selected_dates_df["DATE_STR"].unique())
+    )
+)
+
+# Change to X marks
+fig_scatter.update_traces(marker=dict(symbol="x", size=10))
+
+# Compute y position for annotations (a bit below min Y)
+y_min = selected_dates_df[selected_param].min()
+y_annot = y_min - 0.05 * abs(y_min) if y_min != 0 else -1
+
+# Add annotation per date
+for date_str in sorted(selected_dates_df["DATE_STR"].unique()):
+    times = time_labels.get(date_str, "")
+    if times:
+        fig_scatter.add_annotation(
+            x=date_str,
+            y=y_annot,
+            text=times,
+            showarrow=False,
+            font=dict(size=10, color="black"),
+            align="center",
+            yshift=-10
+        )
+
+st.plotly_chart(fig_scatter)
